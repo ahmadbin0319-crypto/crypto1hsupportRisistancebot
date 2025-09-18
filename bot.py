@@ -8,7 +8,7 @@ import os
 import time
 import ccxt
 import pandas as pd
-from datetime import datetime
+from datetime import datetime, timezone
 from telegram import Bot
 from telegram.constants import ParseMode
 
@@ -122,8 +122,13 @@ def analyze(symbol):
                 "tp": tp,
             }
         return None
+
     except Exception as e:
-        print(f"⚠️ Error analyzing {symbol}: {e}")
+        # Error alert bhi Telegram pe bhej do
+        try:
+            bot.send_message(chat_id=CHAT_ID, text=f"⚠️ Error in {symbol}: {e}")
+        except:
+            pass
         return None
 
 def format_msg(r):
@@ -147,3 +152,4 @@ if __name__ == "__main__":
                 bot.send_message(chat_id=CHAT_ID, text=msg, parse_mode=ParseMode.HTML)
                 break
         time.sleep(900)  # wait 15 min before next scan
+
