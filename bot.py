@@ -1,120 +1,129 @@
-# crypto_signal_bot.py
-import asyncio
-import requests
+"""
+pro_crypto_bot_render.py
+Render friendly Telegram bot – scans every 15 minutes
+Sends only ONE strong pro setup alert (no spam)
+"""
+
+import os
+import time
+import ccxt
 import pandas as pd
-import numpy as np
 from datetime import datetime
-import pytz
 from telegram import Bot
 
-# ================== CONFIG ==================
+# ------------------ CONFIG ------------------
 TELEGRAM_TOKEN = "8209994203:AAEUptxmSVtGjXTosqaqpESm1FXvlGJRJtU"
 CHAT_ID = "5969642968"
 
-SYMBOLS = [
-    "BTCUSDT", "ETHUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT",
-    "SOLUSDT", "MATICUSDT", "DOTUSDT", "LTCUSDT", "TRXUSDT",
-    "AVAXUSDT", "ATOMUSDT", "NEARUSDT", "FTMUSDT", "OPUSDT"
-]  # liquidity filter ke sath top coins
-
-INTERVALS = ["1d", "4h", "1h", "15m"]
-LIMIT = 200
+EXCHANGE = ccxt.binance({'enableRateLimit': True})
+SYMBOLS = ["BTC/USDT","ETH/USDT","BNB/USDT","XRP/USDT","ADA/USDT"]
 
 bot = Bot(token=TELEGRAM_TOKEN)
 
-# ============== BINANCE API HELPER =================
-def fetch_klines(symbol, interval, limit=200):
-    url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit={limit}"
-    data = requests.get(url).json()
-    df = pd.DataFrame(data, columns=[
-        "time", "open", "high", "low", "close", "volume",
-        "close_time", "qav", "trades", "tbbav", "tbqav", "ignore"
-    ])
-    df["open"] = df["open"].astype(float)
-    df["high"] = df["high"].astype(float)
-    df["low"] = df["low"].astype(float)
-    df["close"] = df["close"].astype(float)
-    df["volume"] = df["volume"].astype(float)
+# ------------------ HELPERS ------------------
+def fetch_ohlcv(symbol, timeframe, limit=200):
+    pair = symbol.replace("/", "")
+    data = EXCHANGE.fetch_ohlcv(pair, timeframe, limit=limit)
+    df = pd.DataFrame(data, columns=['ts','open','high','low','close','vol'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms')
     return df
 
-# ============== STRATEGY LOGIC =================
+def get_swings(df, days=3):
+    recent = df.tail(days)
+    return recent['high'].max(), recent['low'].min()
+
 def detect_sr(df):
-    """ Simple S/R detection by swing points """
-    highs = df["high"].rolling(5, center=True).max()
-    lows = df["low"].rolling(5, center=True).min()
-    levels = pd.concat([highs, lows]).dropna().unique()
-    return sorted(levels)
+    levels = []
+    for i in range(2, len(df)-2):
+        if df['high'][i] == max(df['high'][i-2:i+3]):
+            levels.append({'price': df['high'][i], 'type': 'res'})
+        if df['low'][i] == min(df['low'][i-2:i+3]):
+            levels.append({'price': df['low'][i], 'type': 'sup'})
+    uniq = {}
+    for l in levels:
+        uniq[round(l['price'], 2)] = l
+    return list(uniq.values())
 
-def check_signal(symbol):
+def price_action_signal(df15):
+    if len(df15) < 3: return None
+    last, prev = df15.iloc[-1], df15.iloc[-2]
+
+    # bullish engulfing
+    if last['close'] > last['open'] and prev['close'] < prev['open'] and last['close'] > prev['open'] and last['open'] < prev['close']:
+        return "LONG"
+    # bearish engulfing
+    if last['close'] < last['open'] and prev['close'] > prev['open'] and last['close'] < prev['open'] and last['open'] > prev['close']:
+        return "SHORT"
+    # breakout
+    if last['close'] > prev['high']: return "LONG"
+    if last['close'] < prev['low']: return "SHORT"
+    return None
+
+def nearest_sr(levels, price):
+    if not levels: return None
+    return min(levels, key=lambda l: abs(price - l['price']))
+
+def analyze(symbol):
     try:
-        data_1d = fetch_klines(symbol, "1d", LIMIT)
-        data_15m = fetch_klines(symbol, "15m", LIMIT)
+        df1d = fetch_ohlcv(symbol, "1d", 10)
+        df4h = fetch_ohlcv(symbol, "4h", 50)
+        df1h = fetch_ohlcv(symbol, "1h", 100)
+        df15 = fetch_ohlcv(symbol, "15m", 100)
 
-        # Support/Resistance
-        sr_levels = detect_sr(data_1d)
+        swing_high, swing_low = get_swings(df1d, 3)
+        sr_levels = detect_sr(df1d) + detect_sr(df4h) + detect_sr(df1h)
 
-        # Price action breakout/retest check
-        last_close = data_15m["close"].iloc[-1]
-        prev_close = data_15m["close"].iloc[-2]
-        last_high = data_15m["high"].iloc[-1]
-        last_low = data_15m["low"].iloc[-1]
-        last_vol = data_15m["volume"].iloc[-1]
-        avg_vol = data_15m["volume"].tail(20).mean()
+        last_price = df15['close'].iloc[-1]
+        pa = price_action_signal(df15)
+        nearest = nearest_sr(sr_levels, last_price)
 
-        signal = None
-        sl = None
-        tp = None
+        if not pa or not nearest:
+            return None
 
-        for level in sr_levels:
-            # Breakout + Volume filter + Candle size filter
-            if prev_close < level < last_close and last_vol > avg_vol:
-                signal = "BUY"
-                sl = min(data_15m["low"].tail(5))
-                tp = last_close + (last_close - sl) * 2
-            elif prev_close > level > last_close and last_vol > avg_vol:
-                signal = "SELL"
-                sl = max(data_15m["high"].tail(5))
-                tp = last_close - (sl - last_close) * 2
+        signal, sl, tp = None, None, None
+
+        if pa == "LONG" and nearest['type']=="sup" and last_price > nearest['price']:
+            sl = nearest['price']
+            rr = last_price - sl
+            tp = last_price + rr*3
+            signal = "LONG"
+        elif pa == "SHORT" and nearest['type']=="res" and last_price < nearest['price']:
+            sl = nearest['price']
+            rr = sl - last_price
+            tp = last_price - rr*3
+            signal = "SHORT"
 
         if signal:
             return {
                 "symbol": symbol,
+                "price": last_price,
                 "signal": signal,
-                "price": last_close,
-                "sl": round(sl, 2),
-                "tp": round(tp, 2),
-                "volume": round(last_vol, 2),
-                "avg_vol": round(avg_vol, 2),
-                "time": datetime.now(pytz.UTC).strftime("%Y-%m-%d %H:%M:%S")
+                "swing_high": swing_high,
+                "swing_low": swing_low,
+                "nearest": nearest,
+                "sl": sl,
+                "tp": tp
             }
-    except Exception as e:
-        print(f"Error {symbol}: {e}")
-    return None
+        return None
+    except Exception:
+        return None
 
-# ============== TELEGRAM ALERT =================
-async def send_alert(msg: str):
-    await bot.send_message(chat_id=CHAT_ID, text=msg)
+def format_msg(r):
+    return (f"📊 {r['symbol']} | Price: {r['price']}\n"
+            f"Swing High(3d): {r['swing_high']} | Swing Low: {r['swing_low']}\n"
+            f"✅ Signal: {r['signal']}\n"
+            f"Nearest {r['nearest']['type'].upper()}: {r['nearest']['price']}\n"
+            f"SL: {r['sl']} | TP: {r['tp']} (1:3 RR)")
 
-# ============== MAIN LOOP =================
-async def main():
-    print("🚀 Async Crypto Signal Bot started...")
-    while True:
-        for sym in SYMBOLS:
-            signal = check_signal(sym)
-            if signal:
-                message = (
-                    f"📊 A+ Trade Setup\n"
-                    f"Symbol: {signal['symbol']}\n"
-                    f"Signal: {signal['signal']}\n"
-                    f"Entry: {signal['price']}\n"
-                    f"SL: {signal['sl']}\n"
-                    f"TP: {signal['tp']}\n"
-                    f"Volume: {signal['volume']} (Avg: {signal['avg_vol']})\n"
-                    f"Time: {signal['time']}"
-                )
-                print(message)
-                await send_alert(message)
-        await asyncio.sleep(60)
-
+# ------------------ LOOP ------------------
 if __name__ == "__main__":
-    asyncio.run(main())
+    while True:
+        print(f"\n⏳ Scanning {datetime.utcnow()} ...")
+        for sym in SYMBOLS:
+            r = analyze(sym)
+            if r:  # send only ONE pro setup
+                msg = format_msg(r)
+                print(msg)
+                bot.send_message(chat_id=CHAT_ID, text=msg)
+                break
+        time.sleep(900)  # wait 15 min before next scan
