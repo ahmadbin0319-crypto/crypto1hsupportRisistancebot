@@ -138,7 +138,7 @@ def format_msg(r):
 # ------------------ LOOP ------------------
 if __name__ == "__main__":
     while True:
-        print(f"\n⏳ Scanning {datetime.utcnow()} ...")
+        print(f"\n⏳ Scanning {datetime.now(timezone.utc)} ...")
         for sym in SYMBOLS:
             r = analyze(sym)
             if r:  # send only ONE pro setup
