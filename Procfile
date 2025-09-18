@@ -1,1 +1,1 @@
-worker: python crypto_signal_bot.py
+worker: python pro_crypto_bot_render.py
